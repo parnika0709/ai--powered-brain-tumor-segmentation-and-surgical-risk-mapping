@@ -1,0 +1,84 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.whl
+.venv/
+venv/
+env/
+
+# Node
+node_modules/
+.next/
+dist/
+.npm
+.eslintcache
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+.cursor/
+
+# Data — never commit
+data/raw/
+data/processed/
+data/external/
+data/uploads/
+*.nii.gz
+*.nii
+*.dcm
+*.dicom
+*.mhd
+*.raw
+*.nrrd
+
+# Models — too large for git
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.h5
+*.hdf5
+models/checkpoints/
+models/exports/
+
+# ML artifacts
+runs/
+logs/
+wandb/
+mlruns/
+*.log
+*.tmp
+
+# OS
+Thumbs.db
+
+# Coverage / testing
+.coverage
+htmlcov/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Reports — generated
+reports/output/
+reports/*.pdf
+reports/*.html
+
+# Build
+*.egg-info/
+.uv-cache/
