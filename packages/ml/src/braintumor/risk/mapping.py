@@ -1,0 +1,188 @@
+"""Heuristic surgical risk mapping.
+
+This is a DELIBERATELY SIMPLE stand-in for real atlas registration
+(SynthSeg / FSL / ANTsPy are heavy, slow, and not installed here).
+
+Instead of registering a real brain atlas, we approximate each functional
+region as a fixed fractional bounding box relative to the patient's own
+brain bounding box (the box containing all non-zero voxels across
+modalities). This is coarse and NOT anatomically precise, but it is fast,
+has zero extra dependencies, and is good enough to demonstrate the idea:
+"how close is the tumor to a functionally important area?"
+
+Fractions are rough, commonly-cited approximate locations of each region
+within a standard axial brain volume, expressed as (start, end) along each
+axis in [0, 1]:
+  - d: depth / axial slices (0 = inferior/bottom, 1 = superior/top)
+  - h: height (0 = posterior/back, 1 = anterior/front)   [approximation]
+  - w: width (0 = one side, 1 = other side)
+
+NOT clinically validated. Do not use for real surgical planning.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+# name -> (d_range, h_range, w_range), each a (start, end) fraction in [0, 1]
+FUNCTIONAL_REGIONS: dict[str, dict] = {
+    "motor_cortex_left": {
+        "box": ((0.55, 0.85), (0.35, 0.65), (0.0, 0.45)),
+        "function": "controls voluntary movement of the right side of the body",
+    },
+    "motor_cortex_right": {
+        "box": ((0.55, 0.85), (0.35, 0.65), (0.55, 1.0)),
+        "function": "controls voluntary movement of the left side of the body",
+    },
+    "broca_area": {
+        "box": ((0.35, 0.65), (0.55, 0.85), (0.0, 0.4)),
+        "function": "speech production (language expression)",
+    },
+    "wernicke_area": {
+        "box": ((0.35, 0.6), (0.25, 0.55), (0.05, 0.45)),
+        "function": "language comprehension",
+    },
+    "visual_cortex": {
+        "box": ((0.35, 0.65), (0.0, 0.25), (0.25, 0.75)),
+        "function": "visual processing",
+    },
+    "brainstem": {
+        "box": ((0.0, 0.3), (0.4, 0.6), (0.35, 0.65)),
+        "function": "controls vital functions (breathing, heart rate, consciousness)",
+    },
+    "thalamus": {
+        "box": ((0.3, 0.55), (0.4, 0.65), (0.35, 0.65)),
+        "function": "sensory relay and consciousness regulation",
+    },
+}
+
+RISK_TIERS = ("High", "Moderate", "Low")
+
+
+@dataclass
+class RiskRegion:
+    region: str
+    function: str
+    overlap_pct: float
+    distance_mm: float | None
+    risk_tier: str
+
+
+def _brain_bbox(volume_array: np.ndarray) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """Bounding box (in voxel indices) of all non-zero signal across channels.
+
+    volume_array: (C, D, H, W)
+    Returns ((d0, d1), (h0, h1), (w0, w1)) as inclusive-exclusive ranges.
+    """
+    nonzero = np.any(volume_array > 0, axis=0)  # (D, H, W)
+    if not nonzero.any():
+        d, h, w = volume_array.shape[1:]
+        return (0, d), (0, h), (0, w)
+    coords = np.argwhere(nonzero)
+    mins = coords.min(axis=0)
+    maxs = coords.max(axis=0) + 1
+    return (int(mins[0]), int(maxs[0])), (int(mins[1]), int(maxs[1])), (int(mins[2]), int(maxs[2]))
+
+
+def _fractional_box_to_voxels(
+    frac_box: tuple[tuple[float, float], tuple[float, float], tuple[float, float]],
+    brain_bbox: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+) -> tuple[tuple[int, int], tuple[int, int], tuple[int, int]]:
+    out = []
+    for (f0, f1), (b0, b1) in zip(frac_box, brain_bbox):
+        span = b1 - b0
+        out.append((b0 + int(f0 * span), b0 + int(f1 * span)))
+    return tuple(out)  # type: ignore[return-value]
+
+
+def _region_mask(
+    shape: tuple[int, int, int],
+    voxel_box: tuple[tuple[int, int], tuple[int, int], tuple[int, int]],
+) -> np.ndarray:
+    mask = np.zeros(shape, dtype=bool)
+    (d0, d1), (h0, h1), (w0, w1) = voxel_box
+    mask[d0:d1, h0:h1, w0:w1] = True
+    return mask
+
+
+def _distance_mm(
+    tumor_mask: np.ndarray,
+    region_mask: np.ndarray,
+    spacing: tuple[float, float, float],
+) -> float:
+    """Approximate min distance (mm) between tumor and region bounding boxes.
+
+    Uses bounding-box-to-bounding-box gap per axis (fast, no KD-tree needed
+    for this coarse approximation).
+    """
+    tumor_coords = np.argwhere(tumor_mask)
+    if tumor_coords.size == 0:
+        return float("inf")
+    region_coords = np.argwhere(region_mask)
+    if region_coords.size == 0:
+        return float("inf")
+
+    t_min, t_max = tumor_coords.min(axis=0), tumor_coords.max(axis=0)
+    r_min, r_max = region_coords.min(axis=0), region_coords.max(axis=0)
+
+    gap_voxels = np.maximum(0, np.maximum(r_min - t_max, t_min - r_max))
+    gap_mm = gap_voxels * np.asarray(spacing)
+    return float(np.linalg.norm(gap_mm))
+
+
+def _risk_tier(overlap_pct: float, distance_mm: float) -> str:
+    if overlap_pct > 0:
+        return "High"
+    if distance_mm <= 10.0:
+        return "Moderate"
+    return "Low"
+
+
+def compute_risk_regions(
+    tumor_mask: np.ndarray,
+    volume_array: np.ndarray,
+    spacing: tuple[float, float, float],
+) -> list[RiskRegion]:
+    """Compute overlap/distance/risk-tier for every functional region.
+
+    Parameters
+    ----------
+    tumor_mask : (D, H, W) bool or int array (non-zero = tumor)
+    volume_array : (C, D, H, W) — used to find the brain's own bounding box
+    spacing : voxel spacing in mm
+
+    Returns
+    -------
+    list[RiskRegion], sorted High -> Moderate -> Low, then by distance.
+    """
+    tumor_binary = tumor_mask > 0
+    brain_bbox = _brain_bbox(volume_array)
+    shape = tumor_mask.shape
+
+    results: list[RiskRegion] = []
+    for name, cfg in FUNCTIONAL_REGIONS.items():
+        voxel_box = _fractional_box_to_voxels(cfg["box"], brain_bbox)
+        region_mask = _region_mask(shape, voxel_box)
+
+        overlap_voxels = int(np.logical_and(tumor_binary, region_mask).sum())
+        tumor_voxels = int(tumor_binary.sum())
+        overlap_pct = (100.0 * overlap_voxels / tumor_voxels) if tumor_voxels else 0.0
+
+        distance_mm = 0.0 if overlap_pct > 0 else _distance_mm(tumor_binary, region_mask, spacing)
+        tier = _risk_tier(overlap_pct, distance_mm)
+
+        results.append(
+            RiskRegion(
+                region=name.replace("_", " "),
+                function=cfg["function"],
+                overlap_pct=round(overlap_pct, 1),
+                distance_mm=None if distance_mm == float("inf") else round(distance_mm, 1),
+                risk_tier=tier,
+            )
+        )
+
+    tier_order = {"High": 0, "Moderate": 1, "Low": 2}
+    results.sort(key=lambda r: (tier_order[r.risk_tier], r.distance_mm if r.distance_mm is not None else 1e9))
+    return results

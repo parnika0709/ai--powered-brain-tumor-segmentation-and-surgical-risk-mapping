@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Brain Tumor Surgical Risk Mapping</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  body { font-family: -apple-system, Arial, sans-serif; max-width: 780px; margin: 40px auto; padding: 0 16px; color: #222; }
+  h1 { font-size: 22px; }
+  .disclaimer { background: #fff3cd; border: 1px solid #ffe08a; padding: 10px 14px; border-radius: 6px; font-size: 13px; margin-bottom: 20px; }
+  label { display: block; margin-top: 12px; font-size: 14px; font-weight: 600; }
+  input[type=text], input[type=file] { width: 100%; padding: 6px; margin-top: 4px; box-sizing: border-box; }
+  button { margin-top: 18px; padding: 10px 18px; font-size: 15px; cursor: pointer; }
+  #status { margin-top: 14px; font-size: 14px; color: #555; }
+  table { border-collapse: collapse; width: 100%; margin-top: 14px; font-size: 14px; }
+  th, td { border: 1px solid #ddd; padding: 6px 8px; text-align: left; }
+  th { background: #f4f4f4; }
+  .tier-High { color: #b00020; font-weight: 600; }
+  .tier-Moderate { color: #b36b00; font-weight: 600; }
+  .tier-Low { color: #2e7d32; font-weight: 600; }
+  pre { white-space: pre-wrap; background: #fafafa; border: 1px solid #eee; padding: 12px; border-radius: 6px; font-size: 13px; }
+  #result { display: none; }
+</style>
+</head>
+<body>
+
+<h1>Brain Tumor Surgical Risk Mapping</h1>
+<div class="disclaimer">
+  Research/educational prototype. NOT a medical device. NOT validated for
+  clinical or surgical use. Region locations are approximate.
+</div>
+
+<form id="upload-form">
+  <label>Case name</label>
+  <input type="text" id="case_name" required placeholder="e.g. patient-001" />
+
+  <label>T1ce file (.nii / .nii.gz)</label>
+  <input type="file" id="t1ce_file" accept=".nii,.gz" required />
+
+  <label>T2 file (.nii / .nii.gz)</label>
+  <input type="file" id="t2_file" accept=".nii,.gz" required />
+
+  <label>FLAIR file (.nii / .nii.gz)</label>
+  <input type="file" id="flair_file" accept=".nii,.gz" required />
+
+  <button type="submit">Upload & Analyze</button>
+</form>
+
+<div id="status"></div>
+
+<div id="result">
+  <h2>Tumor overview</h2>
+  <p id="tumor-summary"></p>
+
+  <h2>Risk regions</h2>
+  <table>
+    <thead>
+      <tr><th>Region</th><th>Function</th><th>Overlap %</th><th>Distance (mm)</th><th>Risk</th></tr>
+    </thead>
+    <tbody id="risk-table-body"></tbody>
+  </table>
+
+  <h2>Report</h2>
+  <pre id="report-text"></pre>
+</div>
+
+<script>
+const API = ""; // same origin
+
+const form = document.getElementById("upload-form");
+const statusEl = document.getElementById("status");
+const resultEl = document.getElementById("result");
+
+function setStatus(msg) {
+  statusEl.textContent = msg;
+}
+
+async function pollPrediction(caseId, attempts = 60) {
+  for (let i = 0; i < attempts; i++) {
+    const res = await fetch(`${API}/cases/${caseId}/prediction`);
+    if (res.ok) {
+      const data = await res.json();
+      if (data) return data;
+    }
+    await new Promise(r => setTimeout(r, 2000));
+    setStatus(`Running inference... (${i + 1}/${attempts})`);
+  }
+  throw new Error("Timed out waiting for prediction.");
+}
+
+function renderResult(prediction) {
+  const features = (prediction.features && prediction.features.features) || [];
+  const wt = features.find(f => f.label === "whole_tumor");
+  const summary = document.getElementById("tumor-summary");
+  summary.textContent = wt
+    ? `Whole tumor volume: ${Math.round(wt.volume_mm3).toLocaleString()} mm^3 (${wt.voxel_count.toLocaleString()} voxels)`
+    : "No tumor tissue detected.";
+
+  const tbody = document.getElementById("risk-table-body");
+  tbody.innerHTML = "";
+  (prediction.risk_regions || []).forEach(r => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${r.region}</td>
+      <td>${r.function}</td>
+      <td>${r.overlap_pct}%</td>
+      <td>${r.distance_mm === null ? "-" : r.distance_mm}</td>
+      <td class="tier-${r.risk_tier}">${r.risk_tier}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+
+  document.getElementById("report-text").textContent = prediction.risk_report || "";
+  resultEl.style.display = "block";
+}
+
+form.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  resultEl.style.display = "none";
+
+  const caseName = document.getElementById("case_name").value;
+  const t1ce = document.getElementById("t1ce_file").files[0];
+  const t2 = document.getElementById("t2_file").files[0];
+  const flair = document.getElementById("flair_file").files[0];
+
+  const fd = new FormData();
+  fd.append("case_name", caseName);
+  fd.append("t1ce_file", t1ce);
+  fd.append("t2_file", t2);
+  fd.append("flair_file", flair);
+
+  try {
+    setStatus("Uploading...");
+    const createRes = await fetch(`${API}/cases/`, { method: "POST", body: fd });
+    if (!createRes.ok) throw new Error(await createRes.text());
+    const caseData = await createRes.json();
+
+    setStatus("Running inference...");
+    const predictRes = await fetch(`${API}/cases/${caseData.id}/predict`, { method: "POST" });
+    if (!predictRes.ok) throw new Error(await predictRes.text());
+
+    const prediction = await pollPrediction(caseData.id);
+    setStatus("Done.");
+    renderResult(prediction);
+  } catch (err) {
+    setStatus("Error: " + err.message);
+  }
+});
+</script>
+
+</body>
+</html>
